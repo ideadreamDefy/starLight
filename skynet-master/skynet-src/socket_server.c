@@ -46,6 +46,13 @@
 
 #define MAX_UDP_PACKAGE 65535
 
+// EAGAIN and EWOULDBLOCK may be not the same value.
+#if (EAGAIN != EWOULDBLOCK)
+#define AGAIN_WOULDBLOCK EAGAIN : case EWOULDBLOCK
+#else
+#define AGAIN_WOULDBLOCK EAGAIN
+#endif
+
 struct write_buffer {
 	struct write_buffer * next;
 	void *buffer;
@@ -119,6 +126,7 @@ struct request_setudp {
 
 struct request_close {
 	int id;
+	int shutdown;
 	uintptr_t opaque;
 };
 
@@ -336,7 +344,9 @@ force_close(struct socket_server *ss, struct socket *s, struct socket_message *r
 		sp_del(ss->event_fd, s->fd);
 	}
 	if (s->type != SOCKET_TYPE_BIND) {
-		close(s->fd);
+		if (close(s->fd) < 0) {
+			perror("close socket:");
+		}
 	}
 	s->type = SOCKET_TYPE_INVALID;
 }
@@ -408,6 +418,7 @@ open_socket(struct socket_server *ss, struct request_open * request, struct sock
 
 	status = getaddrinfo( request->host, port, &ai_hints, &ai_list );
 	if ( status != 0 ) {
+		result->data = (void *)gai_strerror(status);
 		goto _failed;
 	}
 	int sock= -1;
@@ -428,12 +439,14 @@ open_socket(struct socket_server *ss, struct request_open * request, struct sock
 	}
 
 	if (sock < 0) {
+		result->data = strerror(errno);
 		goto _failed;
 	}
 
 	ns = new_fd(ss, id, sock, PROTOCOL_TCP, request->opaque, true);
 	if (ns == NULL) {
 		close(sock);
+		result->data = "reach skynet socket number limit";
 		goto _failed;
 	}
 
@@ -469,7 +482,7 @@ send_list_tcp(struct socket_server *ss, struct socket *s, struct wb_list *list, 
 				switch(errno) {
 				case EINTR:
 					continue;
-				case EAGAIN:
+				case AGAIN_WOULDBLOCK:
 					return -1;
 				}
 				force_close(ss,s, result);
@@ -525,7 +538,7 @@ send_list_udp(struct socket_server *ss, struct socket *s, struct wb_list *list, 
 		if (err < 0) {
 			switch(errno) {
 			case EINTR:
-			case EAGAIN:
+			case AGAIN_WOULDBLOCK:
 				return -1;
 			}
 			fprintf(stderr, "socket-server : udp (%d) sendto error %s.\n",s->id, strerror(errno));
@@ -699,7 +712,7 @@ send_socket(struct socket_server *ss, struct request_send * request, struct sock
 			if (n<0) {
 				switch(errno) {
 				case EINTR:
-				case EAGAIN:
+				case AGAIN_WOULDBLOCK:
 					n = 0;
 					break;
 				default:
@@ -762,7 +775,7 @@ _failed:
 	result->opaque = request->opaque;
 	result->id = id;
 	result->ud = 0;
-	result->data = NULL;
+	result->data = "reach skynet socket number limit";
 	ss->slot[HASH_ID(id)].type = SOCKET_TYPE_INVALID;
 
 	return SOCKET_ERROR;
@@ -784,7 +797,7 @@ close_socket(struct socket_server *ss, struct request_close *request, struct soc
 		if (type != -1)
 			return type;
 	}
-	if (send_buffer_empty(s)) {
+	if (request->shutdown || send_buffer_empty(s)) {
 		force_close(ss,s,result);
 		result->id = id;
 		result->opaque = request->opaque;
@@ -803,7 +816,7 @@ bind_socket(struct socket_server *ss, struct request_bind *request, struct socke
 	result->ud = 0;
 	struct socket *s = new_fd(ss, id, request->fd, PROTOCOL_TCP, request->opaque, true);
 	if (s == NULL) {
-		result->data = NULL;
+		result->data = "reach skynet socket number limit";
 		return SOCKET_ERROR;
 	}
 	sp_nonblocking(request->fd);
@@ -821,11 +834,13 @@ start_socket(struct socket_server *ss, struct request_start *request, struct soc
 	result->data = NULL;
 	struct socket *s = &ss->slot[HASH_ID(id)];
 	if (s->type == SOCKET_TYPE_INVALID || s->id !=id) {
+		result->data = "invalid socket";
 		return SOCKET_ERROR;
 	}
 	if (s->type == SOCKET_TYPE_PACCEPT || s->type == SOCKET_TYPE_PLISTEN) {
 		if (sp_add(ss->event_fd, s->fd, s)) {
-			s->type = SOCKET_TYPE_INVALID;
+			force_close(ss, s, result);
+			result->data = strerror(errno);
 			return SOCKET_ERROR;
 		}
 		s->type = (s->type == SOCKET_TYPE_PACCEPT) ? SOCKET_TYPE_CONNECTED : SOCKET_TYPE_LISTEN;
@@ -833,10 +848,12 @@ start_socket(struct socket_server *ss, struct request_start *request, struct soc
 		result->data = "start";
 		return SOCKET_OPEN;
 	} else if (s->type == SOCKET_TYPE_CONNECTED) {
+		// todo: maybe we should send a message SOCKET_TRANSFER to s->opaque
 		s->opaque = request->opaque;
 		result->data = "transfer";
 		return SOCKET_OPEN;
 	}
+	// if s->type == SOCKET_TYPE_HALFCLOSE , SOCKET_CLOSE message will send later
 	return -1;
 }
 
@@ -913,7 +930,7 @@ set_udp_address(struct socket_server *ss, struct request_setudp *request, struct
 		result->opaque = s->opaque;
 		result->id = s->id;
 		result->ud = 0;
-		result->data = NULL;
+		result->data = "protocol mismatch";
 
 		return SOCKET_ERROR;
 	}
@@ -989,12 +1006,13 @@ forward_message_tcp(struct socket_server *ss, struct socket *s, struct socket_me
 		switch(errno) {
 		case EINTR:
 			break;
-		case EAGAIN:
+		case AGAIN_WOULDBLOCK:
 			fprintf(stderr, "socket-server: EAGAIN capture.\n");
 			break;
 		default:
 			// close when error
 			force_close(ss, s, result);
+			result->data = strerror(errno);
 			return SOCKET_ERROR;
 		}
 		return -1;
@@ -1050,11 +1068,12 @@ forward_message_udp(struct socket_server *ss, struct socket *s, struct socket_me
 	if (n<0) {
 		switch(errno) {
 		case EINTR:
-		case EAGAIN:
+		case AGAIN_WOULDBLOCK:
 			break;
 		default:
 			// close when error
 			force_close(ss, s, result);
+			result->data = strerror(errno);
 			return SOCKET_ERROR;
 		}
 		return -1;
@@ -1088,6 +1107,10 @@ report_connect(struct socket_server *ss, struct socket *s, struct socket_message
 	int code = getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &error, &len);  
 	if (code < 0 || error) {  
 		force_close(ss,s, result);
+		if (code >= 0)
+			result->data = strerror(error);
+		else
+			result->data = strerror(errno);
 		return SOCKET_ERROR;
 	} else {
 		s->type = SOCKET_TYPE_CONNECTED;
@@ -1111,14 +1134,22 @@ report_connect(struct socket_server *ss, struct socket *s, struct socket_message
 	}
 }
 
-// return 0 when failed
+// return 0 when failed, or -1 when file limit
 static int
 report_accept(struct socket_server *ss, struct socket *s, struct socket_message *result) {
 	union sockaddr_all u;
 	socklen_t len = sizeof(u);
 	int client_fd = accept(s->fd, &u.s, &len);
 	if (client_fd < 0) {
-		return 0;
+		if (errno == EMFILE || errno == ENFILE) {
+			result->opaque = s->opaque;
+			result->id = s->id;
+			result->ud = 0;
+			result->data = strerror(errno);
+			return -1;
+		} else {
+			return 0;
+		}
 	}
 	int id = reserve_id(ss);
 	if (id < 0) {
@@ -1160,6 +1191,7 @@ clear_closed_event(struct socket_server *ss, struct socket_message * result, int
 			if (s) {
 				if (s->type == SOCKET_TYPE_INVALID && s->id == id) {
 					e->s = NULL;
+					break;
 				}
 			}
 		}
@@ -1203,11 +1235,16 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 		switch (s->type) {
 		case SOCKET_TYPE_CONNECTING:
 			return report_connect(ss, s, result);
-		case SOCKET_TYPE_LISTEN:
-			if (report_accept(ss, s, result)) {
+		case SOCKET_TYPE_LISTEN: {
+			int ok = report_accept(ss, s, result);
+			if (ok > 0) {
 				return SOCKET_ACCEPT;
-			} 
+			} if (ok < 0 ) {
+				return SOCKET_ERROR;
+			}
+			// when ok == 0, retry
 			break;
+		}
 		case SOCKET_TYPE_INVALID:
 			fprintf(stderr, "socket-server: invalid socket\n");
 			break;
@@ -1224,21 +1261,19 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 						return SOCKET_UDP;
 					}
 				}
-				if (e->write) {
+				if (e->write && type != SOCKET_CLOSE && type != SOCKET_ERROR) {
 					// Try to dispatch write message next step if write flag set.
 					e->read = false;
 					--ss->event_index;
 				}
 				if (type == -1)
-					break;
-				clear_closed_event(ss, result, type);
+					break;				
 				return type;
 			}
 			if (e->write) {
 				int type = send_buffer(ss, s, result);
 				if (type == -1)
 					break;
-				clear_closed_event(ss, result, type);
 				return type;
 			}
 			break;
@@ -1343,6 +1378,17 @@ void
 socket_server_close(struct socket_server *ss, uintptr_t opaque, int id) {
 	struct request_package request;
 	request.u.close.id = id;
+	request.u.close.shutdown = 0;
+	request.u.close.opaque = opaque;
+	send_request(ss, &request, 'K', sizeof(request.u.close));
+}
+
+
+void
+socket_server_shutdown(struct socket_server *ss, uintptr_t opaque, int id) {
+	struct request_package request;
+	request.u.close.id = id;
+	request.u.close.shutdown = 1;
 	request.u.close.opaque = opaque;
 	send_request(ss, &request, 'K', sizeof(request.u.close));
 }

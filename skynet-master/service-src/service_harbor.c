@@ -313,10 +313,10 @@ forward_local_messsage(struct harbor *h, void *msg, int sz) {
 	message_to_header((const uint32_t *)cookie, &header);
 
 	uint32_t destination = header.destination;
-	int type = (destination >> HANDLE_REMOTE_SHIFT) | PTYPE_TAG_DONTCOPY;
+	int type = destination >> HANDLE_REMOTE_SHIFT;
 	destination = (destination & HANDLE_MASK) | ((uint32_t)h->id << HANDLE_REMOTE_SHIFT);
 
-	if (skynet_send(h->ctx, header.source, destination, type, (int)header.session, (void *)msg, sz-HEADER_COOKIE_LENGTH) < 0) {
+	if (skynet_send(h->ctx, header.source, destination, type | PTYPE_TAG_DONTCOPY , (int)header.session, (void *)msg, sz-HEADER_COOKIE_LENGTH) < 0) {
 		if (type != PTYPE_ERROR) {
 			// don't need report error when type is error
 			skynet_send(h->ctx, destination, header.source , PTYPE_ERROR, (int)header.session, NULL, 0);
@@ -346,7 +346,6 @@ dispatch_name_queue(struct harbor *h, struct keyvalue * node) {
 	struct harbor_msg_queue * queue = node->queue;
 	uint32_t handle = node->value;
 	int harbor_id = handle >> HANDLE_REMOTE_SHIFT;
-	assert(harbor_id != 0);
 	struct skynet_context * context = h->ctx;
 	struct slave *s = &h->s[harbor_id];
 	int fd = s->fd;
@@ -365,6 +364,16 @@ dispatch_name_queue(struct harbor *h, struct keyvalue * node) {
 				while ((m = pop_queue(queue))!=NULL) {
 					push_queue_msg(s->queue, m);
 				}
+			}
+			if (harbor_id == (h->slave >> HANDLE_REMOTE_SHIFT)) {
+				// the harbor_id is local
+				struct harbor_msg * m;
+				while ((m = pop_queue(s->queue)) != NULL) {
+					int type = m->header.destination >> HANDLE_REMOTE_SHIFT;
+					skynet_send(context, m->header.source, handle , type | PTYPE_TAG_DONTCOPY, m->header.session, m->buffer, m->size);
+				}
+				release_queue(s->queue);
+				s->queue = NULL;
 			}
 		}
 		return;
